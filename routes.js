@@ -1,0 +1,232 @@
+const express = require('express');
+
+// ===== Config (override via env vars for production) =====
+const TMDB_KEY = process.env.TMDB_KEY || '61e2290429798c561450eb56b26de19b';
+const STREAM_API = 'https://api.wecollege.net';
+const HDRS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  'Origin': 'https://www.movy.sx',
+  'Referer': 'https://www.movy.sx/',
+};
+const SERVERS = [
+  'miami', 'boise', 'atlanta', 'seattle', 'denver', 'phoenix', 'portland', 'austin',
+  'dallas', 'tampa', 'orlando', 'munich', 'berlin', 'paris', 'delhi', 'cancun',
+];
+const CACHE_TTL = parseInt(process.env.CACHE_TTL_MS || '1800000', 10); // 30 min default
+
+// ===== In-memory cache (successful responses only) =====
+const cache = new Map(); // key: `${tmdbId}:${server}:${season}:${episode}` -> { data, expiresAt }
+
+// ===== Movy STREAMCRYPTO v2 decrypt (clean port from chunk 1zyk0gv4kwtq5.js) =====
+const DC = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,
+            0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,
+            0x9bdc06a7,0xc19bf174];
+const MAGIC = [109, 118, 109, 49]; // "mvm1"
+const imul = (a, b) => Math.imul(a | 0, b | 0) >>> 0;
+const rotl = (x, n) => { x = x >>> 0; n &= 31; if (!n) return x; return ((x << n) | (x >>> (32 - n))) >>> 0; };
+const mix = (x) => {
+  x = x >>> 0;
+  x = x ^ (x >>> 16); x = imul(x, 0x85ebca6b);
+  x = x ^ (x >>> 13); x = imul(x, 0xc2b2ae35);
+  x = x ^ (x >>> 16);
+  return x >>> 0;
+};
+
+function decrypt(ctB64, seed, mediaId) {
+  const padded = ctB64.replace(/-/g, '+').replace(/_/g, '/').padEnd(4 * Math.ceil(ctB64.length / 4), '=');
+  const ct = Buffer.from(padded, 'base64');
+
+  // Derive keystream state from (seed, mediaId)
+  const e = seed;
+  const aNum = Number(mediaId) >>> 0;
+  const S = new Array(61).fill(undefined);
+  let fnv = 0x811c9dc5;
+  for (let k = 0; k < e.length; k++) fnv = imul(fnv ^ e.charCodeAt(k), 0x1000193);
+  let n = mix(mix(fnv) ^ mix(aNum ^ 0x9e3779b9));
+  for (let k = 0; k < 8; k++) {
+    const pos = n % 61;
+    n = rotl(n + 0x9e3779b9, 7 + (7 & k));
+    S[pos] = (n ^ mix(n)) >>> 0;
+    n = mix(n + pos);
+  }
+  let acc = mix(0xa5a5a5a5 ^ n);
+
+  // Generate keystream
+  const ks = Buffer.alloc(ct.length);
+  let counter = 0, outIdx = 0;
+  while (outIdx < ct.length) {
+    const d = acc % 61;
+    const assigned = S[d] !== undefined;
+    const i = assigned ? -1 : 0;
+    const r = assigned ? (S[d] >>> 0) : 0;
+    const c = imul(0x9e3779b9, counter + 1);
+    const t = acc, s = (r ^ c) >>> 0;
+    let b = ((t ^ s) | (t & s & i)) >>> 0;
+    b = (rotl(b + acc, 31 & d) ^ rotl(acc, 31 & imul(d, 7))) >>> 0;
+    b = (b + 0x9e3779b9) >>> 0;
+    acc = mix(b);
+    S[d] = acc >>> 0;
+    ks[outIdx++] = acc & 0xFF;
+    if (outIdx < ct.length) ks[outIdx++] = (acc >>> 8) & 0xFF;
+    if (outIdx < ct.length) ks[outIdx++] = (acc >>> 16) & 0xFF;
+    if (outIdx < ct.length) ks[outIdx++] = (acc >>> 24) & 0xFF;
+    counter++;
+  }
+
+  // XOR + verify integrity (first 4 bytes = "mvm1")
+  const pt = Buffer.alloc(ct.length);
+  for (let k = 0; k < ct.length; k++) pt[k] = ct[k] ^ ks[k];
+  for (let k = 0; k < MAGIC.length; k++) {
+    if (pt[k] !== MAGIC[k]) throw new Error('decrypt failed: bad seed or tampered payload');
+  }
+  return pt.slice(MAGIC.length).toString('utf-8');
+}
+
+// ===== Movy seed fetcher (with TTL cache) =====
+const seedCache = new Map();
+async function getSeed(mediaId) {
+  const now = Date.now();
+  const cached = seedCache.get(mediaId);
+  if (cached && cached.expiresAt - 5000 > now) return cached.seed;
+  const r = await fetch(`${STREAM_API}/seed?mediaId=${mediaId}`, { headers: HDRS });
+  if (!r.ok) throw new Error(`seed HTTP ${r.status}`);
+  const data = await r.json();
+  seedCache.set(mediaId, { seed: data.seed, expiresAt: now + (data.ttlMs || 30000) });
+  return data.seed;
+}
+
+// ===== Fetch + decrypt sources from one server =====
+async function getSources(server, p) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const seed = await getSeed(p.tmdbId);
+    const params = new URLSearchParams({
+      title: p.title, mediaType: p.mediaType, totalSeasons: String(p.totalSeasons),
+      seasonId: String(p.seasonId), episodeId: String(p.episodeId),
+      tmdbId: p.tmdbId, imdbId: p.imdbId, b35ebba4: p.b35ebba4,
+      enc: '2', seed,
+    });
+    const r = await fetch(`${STREAM_API}/${server}/sources?${params}`, { headers: HDRS });
+    if (r.status === 401 && attempt === 0) { seedCache.delete(p.tmdbId); continue; }
+    if (!r.ok) throw new Error(`${server} HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
+    const ct = await r.text();
+    return JSON.parse(decrypt(ct, seed, p.tmdbId));
+  }
+  throw new Error('exhausted seed retries');
+}
+
+// ===== TMDB lookup =====
+async function getTmdbMeta(tmdbId, typeHint) {
+  const types = typeHint ? [typeHint, typeHint === 'tv' ? 'movie' : 'tv'] : ['tv', 'movie'];
+  for (const t of types) {
+    const url = `https://api.themoviedb.org/3/${t}/${tmdbId}?api_key=${TMDB_KEY}&append_to_response=external_ids`;
+    const r = await fetch(url);
+    if (r.ok) {
+      const d = await r.json();
+      return {
+        title: d.name || d.title,
+        imdbId: d.external_ids?.imdb_id,
+        totalSeasons: d.number_of_seasons || 1,
+        mediaType: t,
+      };
+    }
+  }
+  throw new Error(`TMDB lookup failed for id ${tmdbId}`);
+}
+
+// ===== b35ebba4 anti-leak token =====
+const XOR_KEY = '8c465aa8af6cbfd4c1f91bf0c8d678ba';
+function computeB35ebba4(title, tmdbId) {
+  const k = XOR_KEY.split('').map(c => c.charCodeAt(0));
+  const hex = (title + tmdbId).split('')
+    .map(c => c.charCodeAt(0))
+    .map(code => k.reduce((a, x) => a ^ x, code))
+    .map(b => ('0' + b.toString(16)).slice(-2))
+    .join('');
+  return Buffer.from(hex, 'utf-8').toString('base64');
+}
+
+// ===== Routes =====
+const router = express.Router();
+
+router.get('/', (req, res) => {
+  res.json({
+    name: 'Movy API Proxy',
+    description: 'Get decrypted stream sources from movy.sx by TMDB ID + server name/number.',
+    endpoints: {
+      'GET /api/movie/:id': 'Get sources for a TMDB ID',
+      'GET /api/servers': 'List available servers',
+    },
+    usage: '/api/movie/273207?server=miami&season=1&episode=1&type=tv',
+    params: {
+      server: 'Server name (miami, boise, ...) OR 1-indexed number (1-16)',
+      season: 'Season number (default 1, TV only)',
+      episode: 'Episode number (default 1, TV only)',
+      type: 'tv or movie (default: auto-detect, tries tv first)',
+    },
+    servers: SERVERS.map((name, i) => ({ id: i + 1, name })),
+    caching: `Successful responses cached for ${CACHE_TTL / 60000} min. Failures are NOT cached.`,
+  });
+});
+
+router.get('/api/servers', (req, res) => {
+  res.json(SERVERS.map((name, i) => ({ id: i + 1, name })));
+});
+
+router.get('/api/movie/:id', async (req, res) => {
+  const tmdbId = req.params.id;
+  let server = req.query.server;
+
+  if (!server) {
+    return res.status(400).json({
+      error: 'Missing ?server= parameter',
+      hint: 'Use server name (e.g. ?server=miami) or 1-indexed number (e.g. ?server=1)',
+      available: SERVERS.map((name, i) => ({ id: i + 1, name })),
+    });
+  }
+
+  if (/^\d+$/.test(server)) {
+    const idx = parseInt(server, 10) - 1;
+    if (idx < 0 || idx >= SERVERS.length) {
+      return res.status(400).json({ error: `Invalid server number. Use 1-${SERVERS.length}` });
+    }
+    server = SERVERS[idx];
+  } else {
+    server = String(server).toLowerCase();
+    if (!SERVERS.includes(server)) {
+      return res.status(400).json({ error: `Unknown server "${server}"`, available: SERVERS });
+    }
+  }
+
+  const season = parseInt(req.query.season, 10) || 1;
+  const episode = parseInt(req.query.episode, 10) || 1;
+  const typeHint = req.query.type;
+
+  const cacheKey = `${tmdbId}:${server}:${season}:${episode}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return res.json({ ...cached.data, server, cached: true, cacheExpiresAt: new Date(cached.expiresAt).toISOString() });
+  }
+
+  try {
+    const meta = await getTmdbMeta(tmdbId, typeHint);
+    const b35ebba4 = computeB35ebba4(meta.title, tmdbId);
+    const params = {
+      title: meta.title, mediaType: meta.mediaType, totalSeasons: meta.totalSeasons,
+      seasonId: season, episodeId: episode, tmdbId, imdbId: meta.imdbId, b35ebba4,
+    };
+
+    const result = await getSources(server, params);
+
+    // Cache ONLY on success
+    cache.set(cacheKey, { data: result, expiresAt: Date.now() + CACHE_TTL });
+
+    res.json({
+      server, tmdbId, title: meta.title, mediaType: meta.mediaType,
+      imdbId: meta.imdbId, season, episode, cached: false, ...result,
+    });
+  } catch (e) {
+    res.status(502).json({ error: e.message, server, tmdbId });
+  }
+});
+
+module.exports = router;

@@ -1,0 +1,9 @@
+# Coolify nixpacks config (alternative to Dockerfile — used if you select "Nixpacks" build pack)
+[phases.setup]
+nixPkgs = ['nodejs_18']
+
+[phases.install]
+cmds = ['npm ci --omit=dev']
+
+[start]
+cmd = 'node index.js'
