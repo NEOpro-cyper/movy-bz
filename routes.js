@@ -239,10 +239,11 @@ router.get('/', (req, res) => {
     name: 'Movy API Proxy',
     description: 'Get decrypted stream sources from movy.sx by TMDB ID + server name/number.',
     endpoints: {
-      'GET /api/movie/:id': 'Get sources for a TMDB ID',
+      'GET /api/movie/:id': 'Movie sources — /api/movie/20526?server=miami&worker=1',
+      'GET /api/tv/:id/:season/:episode': 'TV sources — /api/tv/273207/1/1?server=miami&worker=1 (season/episode default to 1)',
       'GET /api/servers': 'List available servers',
     },
-    usage: '/api/movie/273207?server=miami&season=1&episode=1&type=tv',
+    usage: '/api/tv/273207/1/1?server=miami&worker=1   |   /api/movie/20526?server=miami&worker=0',
     params: {
       server: 'Server name (miami, boise, ...) OR 1-indexed number (1-16)',
       season: 'Season number (default 1, TV only)',
@@ -267,7 +268,8 @@ router.get('/api/servers', (req, res) => {
   res.json(SERVERS.map((name, i) => ({ id: i + 1, name })));
 });
 
-router.get('/api/movie/:id', async (req, res) => {
+// ===== Shared handler (movie + tv path-style routes) =====
+async function handleStream(req, res, { fixedType } = {}) {
   const tmdbId = req.params.id;
   let server = req.query.server;
 
@@ -292,9 +294,10 @@ router.get('/api/movie/:id', async (req, res) => {
     }
   }
 
-  const season = parseInt(req.query.season, 10) || 1;
-  const episode = parseInt(req.query.episode, 10) || 1;
-  const typeHint = req.query.type;
+  // Path params (tv route) take precedence, then query params, then defaults
+  const season = parseInt(req.params.season, 10) || parseInt(req.query.season, 10) || 1;
+  const episode = parseInt(req.params.episode, 10) || parseInt(req.query.episode, 10) || 1;
+  const typeHint = fixedType || req.query.type;
   const useWorker = ['1', 'true', 'yes', 'on'].includes(String(req.query.worker || '').toLowerCase());
 
   const cacheKey = `${tmdbId}:${server}:${season}:${episode}`;
@@ -326,6 +329,12 @@ router.get('/api/movie/:id', async (req, res) => {
   } catch (e) {
     res.status(502).json({ error: e.message, server, tmdbId });
   }
-});
+}
+
+// GET /api/movie/:id?server=... — movie sources
+router.get('/api/movie/:id', (req, res) => handleStream(req, res, { fixedType: 'movie' }));
+
+// GET /api/tv/:id/:season/:episode?server=... — TV sources (season/episode optional, default 1)
+router.get('/api/tv/:id/:season?/:episode?', (req, res) => handleStream(req, res, { fixedType: 'tv' }));
 
 module.exports = router;
