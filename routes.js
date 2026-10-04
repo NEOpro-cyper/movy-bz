@@ -296,7 +296,6 @@ router.get('/api/movie/:id', async (req, res) => {
   const episode = parseInt(req.query.episode, 10) || 1;
   const typeHint = req.query.type;
   const useWorker = ['1', 'true', 'yes', 'on'].includes(String(req.query.worker || '').toLowerCase());
-  const useWorker = ['1', 'true', 'yes', 'on'].includes(String(req.query.worker || '').toLowerCase());
 
   const cacheKey = `${tmdbId}:${server}:${season}:${episode}`;
   const cached = cache.get(cacheKey);
