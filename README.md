@@ -92,6 +92,7 @@ Returns decrypted stream sources (m3u8 URLs, subtitles) for a TMDB title.
 | `season`  | no       | Season number (default `1`, TV only)                     |
 | `episode` | no       | Episode number (default `1`, TV only)                    |
 | `type`    | no       | `tv` or `movie` (default: auto-detect — tries tv first)  |
+| `worker`  | no       | `worker=1` — rewrite stream + subtitle URLs through the CF worker (default off) |
 
 ```bash
 # By server name
@@ -105,6 +106,9 @@ curl 'http://localhost:3000/api/movie/20526?server=miami&type=movie'
 
 # Specific episode
 curl 'http://localhost:3000/api/movie/273207?server=phoenix&season=1&episode=5'
+
+# Route stream + subtitle URLs through the CF worker (bypass CDN edge blocks)
+curl 'http://localhost:3000/api/movie/273207?server=miami&worker=1'
 ```
 
 **Response:**
@@ -118,6 +122,7 @@ curl 'http://localhost:3000/api/movie/273207?server=phoenix&season=1&episode=5'
   "imdbId": "tt33539520",
   "season": 1,
   "episode": 1,
+  "worker": false,
   "cached": false,
   "sources": [
     { "quality": "1080p", "url": "https://moon.quietridge.top/vd/.../index-s1080p-v1-a1.m3u8" },
@@ -128,6 +133,22 @@ curl 'http://localhost:3000/api/movie/273207?server=phoenix&season=1&episode=5'
   "playlist": "https://moon.quietridge.top/vd/.../master.m3u8"
 }
 ```
+
+With `&worker=1`, every stream/subtitle URL (including `playlist`) is prefixed with the
+worker origin so playback goes through your Cloudflare worker:
+
+```json
+{
+  "worker": true,
+  "sources": [
+    { "quality": "1080p", "url": "https://icy-art-1d5b-movy.ntb7nmytsd.workers.dev/https://moon.zenoak.top/vd/.../index-s1080p-v1-a1.m3u8" }
+  ],
+  "playlist": "https://icy-art-1d5b-movy.ntb7nmytsd.workers.dev/https://moon.zenoak.top/vd/.../master.m3u8"
+}
+```
+
+URLs are never double-wrapped, and the cache stores raw (unwrapped) URLs — so the same
+cache entry serves both `worker=0` and `worker=1` requests correctly.
 
 ### `GET /api/servers`
 
@@ -172,14 +193,30 @@ API documentation (JSON).
 | `PORT`          | `3000`                   | HTTP listen port (VPS/Coolify only) |
 | `TMDB_KEY`      | hardcoded fallback       | TMDB API key (override in production) |
 | `CACHE_TTL_MS`  | `1800000` (30 min)       | Cache TTL for successful responses  |
+| `PROXY_HOST`    | `p.webshare.io`          | Webshare proxy host                 |
+| `PROXY_PORT`    | `80`                     | Webshare proxy port                 |
+| `PROXY_USERNAME`| `dkmxrsew-rotate`        | Webshare proxy username (rotate)    |
+| `PROXY_PASSWORD`| `hd1zl1cegrxs`           | Webshare proxy password             |
+| `PROXY_URL`     | built from the 4 vars    | Full proxy URL override (`http://user:pass@host:port`) |
+| `PROXY_ENABLED` | `true`                   | `false` disables the proxy (direct fetch) |
+| `PROXY_TMDB`    | `false`                  | `true` also routes TMDB lookups through the proxy |
+| `PROXY_FALLBACK_DIRECT` | `true`           | Retry direct once if the proxy itself is unreachable |
+| `UPSTREAM_TIMEOUT_MS` | `20000`            | Timeout per upstream request        |
+| `WORKER_URL`    | `https://icy-art-1d5b-movy.ntb7nmytsd.workers.dev` | Worker origin used for `?worker=1` URL rewriting |
 
 ```bash
 # Coolify / VPS
 PORT=8080 TMDB_KEY=your_key_here CACHE_TTL_MS=3600000 node index.js
 
+# Disable proxy / send TMDB through proxy too
+PROXY_ENABLED=false node index.js
+PROXY_TMDB=true node index.js
+
 # Vercel — set in dashboard or:
 vercel env add TMDB_KEY
 vercel env add CACHE_TTL_MS
+vercel env add PROXY_PASSWORD
+vercel env add WORKER_URL
 ```
 
 ## How It Works
@@ -188,14 +225,19 @@ For each request, the server:
 
 1. Looks up title, `imdb_id`, and `total_seasons` from TMDB (`api.themoviedb.org`).
 2. Computes the `b35ebba4` anti-leak token: `base64(xorEncode(title + tmdbId))`.
-3. Fetches a short-lived seed (30s TTL) from `api.wecollege.net/seed`.
-4. Calls `api.wecollege.net/<server>/sources?...&enc=2&seed=...` — returns base64 ciphertext.
+3. Fetches a short-lived seed (30s TTL) from `api.wecollege.net/seed` — **via the Webshare rotating proxy** (`p.webshare.io:80`, credentials baked in, override with env vars).
+4. Calls `api.wecollege.net/<server>/sources?...&enc=2&seed=...` — also via the proxy — returns base64 ciphertext.
 5. Decrypts using STREAMCRYPTO v2 (custom cipher: FNV-1a + golden ratio + SHA-256 constants + RC4-style KSA, keyed by `seed` + `mediaId`).
-6. Returns `{sources, subtitles, playlist}` JSON.
-7. Caches the result for 30 min (only on success).
+6. If `?worker=1` was passed, prefixes `sources[].url`, `subtitles[].url` and `playlist` with the CF worker origin (`WORKER_URL`).
+7. Returns `{sources, subtitles, playlist}` JSON.
+8. Caches the **raw** result for 30 min (only on success) — worker rewriting is applied at serve time.
 
 ## Notes
 
+- **Proxy:** all `api.wecollege.net` calls (seed + sources) go through the Webshare rotating proxy by default — each request may exit from a different IP. If upstream ever binds the seed to an IP and you see repeated 401s, switch to a sticky session by overriding `PROXY_USERNAME` (Webshare sticky format) or set `PROXY_URL`.
+- **TMDB** lookups are direct by default (TMDB rarely blocks hosting IPs); set `PROXY_TMDB=true` to proxy them too.
+- If the proxy is unreachable, requests fall back to direct once (disable with `PROXY_FALLBACK_DIRECT=false`).
+- **Worker rewriting** is opt-in per request via `&worker=1` (accepts `1/true/yes/on`); URLs already pointing at the worker are never double-wrapped.
 - Some servers may return 500 (e.g. `portland: title not found`, `berlin: kinoger unavailable`) — that's the upstream scraper failing, not this API.
 - Movy's backend rate-limits aggressively. If you hit 429s, slow down — sequential calls with ~2s delay are safest.
 - CORS is enabled (`Access-Control-Allow-Origin: *`) so browser frontends can call this API directly.
