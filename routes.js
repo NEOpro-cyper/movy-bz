@@ -1,5 +1,91 @@
 const express = require('express');
 
+// ===== Optional undici ProxyAgent — routes upstream fetches through an HTTP proxy =====
+let undici = null;
+try { undici = require('undici'); } catch (_) { /* not installed — falls back to direct fetch */ }
+
+// ===== Proxy config (Webshare rotating proxy — override via env vars) =====
+const PROXY_HOST = process.env.PROXY_HOST || 'p.webshare.io';
+const PROXY_PORT = process.env.PROXY_PORT || '80';
+const PROXY_USERNAME = process.env.PROXY_USERNAME || 'dkmxrsew-rotate';
+const PROXY_PASSWORD = process.env.PROXY_PASSWORD || 'hd1zl1cegrxs';
+const PROXY_ENABLED = String(process.env.PROXY_ENABLED ?? 'true') !== 'false';
+const PROXY_URL = process.env.PROXY_URL ||
+  `http://${encodeURIComponent(PROXY_USERNAME)}:${encodeURIComponent(PROXY_PASSWORD)}@${PROXY_HOST}:${PROXY_PORT}`;
+// Route TMDB lookups through the proxy too? (movy upstream is ALWAYS proxied)
+const PROXY_TMDB = String(process.env.PROXY_TMDB ?? 'false') === 'true';
+// If the proxy itself is unreachable, retry the request once without it
+const PROXY_FALLBACK_DIRECT = String(process.env.PROXY_FALLBACK_DIRECT ?? 'true') !== 'false';
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '20000', 10);
+
+let proxyAgent = null;
+if (PROXY_ENABLED && undici) {
+  try {
+    proxyAgent = new undici.ProxyAgent(PROXY_URL);
+  } catch (e) {
+    console.warn(`[movy-api] failed to init proxy agent: ${e.message}`);
+  }
+}
+console.log(`[movy-api] proxy ${PROXY_ENABLED ? (proxyAgent ? `ON -> ${PROXY_HOST}:${PROXY_PORT}` : 'requested but undici missing — using direct fetch') : 'OFF'}`);
+
+// ===== Cloudflare worker rewriting (?worker=1) =====
+// When enabled, stream + subtitle URLs are prefixed with the worker origin so the
+// worker fetches them on the server side (bypasses geo/IP blocks on the CDN edge).
+// Example: https://icy-art-1d5b-movy.ntb7nmytsd.workers.dev/https://moon.zenoak.top/vd/.../master.m3u8
+const WORKER_BASE = (process.env.WORKER_URL || 'https://icy-art-1d5b-movy.ntb7nmytsd.workers.dev').replace(/\/+$/, '');
+const WORKER_PREFIX = `${WORKER_BASE}/`;
+
+function workerWrap(url) {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return url;
+  if (url.startsWith(WORKER_PREFIX)) return url; // already wrapped — never double-wrap
+  return WORKER_PREFIX + url;
+}
+
+function applyWorker(data, on) {
+  if (!on) return data;
+  const out = structuredClone(data);
+  if (Array.isArray(out.sources)) {
+    out.sources = out.sources.map(s => ({ ...s, url: workerWrap(s.url) }));
+  }
+  if (Array.isArray(out.subtitles)) {
+    out.subtitles = out.subtitles.map(t => {
+      const copy = { ...t };
+      for (const k of ['url', 'file', 'link']) if (copy[k]) copy[k] = workerWrap(copy[k]);
+      return copy;
+    });
+  }
+  if (out.playlist) out.playlist = workerWrap(out.playlist);
+  if (out.thumbnail) out.thumbnail = workerWrap(out.thumbnail);
+  return out;
+}
+
+// ===== Proxy-aware fetch =====
+// useProxy: route through the Webshare proxy. Default ON for the movy upstream
+// (seed + sources), OFF for TMDB unless PROXY_TMDB=true. If the proxy itself is
+// unreachable (connection-level error), retries once direct when allowed.
+function shouldFallbackDirect(e) {
+  const code = e && (e.code || e.cause?.code);
+  return ['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND', 'ETIMEDOUT',
+          'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET'].includes(code);
+}
+
+async function upstreamFetch(url, opts = {}, { proxy = true } = {}) {
+  const fetchImpl = undici ? undici.fetch : globalThis.fetch;
+  const baseOpts = { ...opts, signal: opts.signal || AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) };
+  if (proxy && proxyAgent) {
+    try {
+      return await fetchImpl(url, { ...baseOpts, dispatcher: proxyAgent });
+    } catch (e) {
+      if (PROXY_FALLBACK_DIRECT && shouldFallbackDirect(e)) {
+        console.warn(`[movy-api] proxy failed for ${url} (${e.code || e.message}) — retrying direct`);
+        return await fetchImpl(url, baseOpts);
+      }
+      throw e;
+    }
+  }
+  return fetchImpl(url, baseOpts);
+}
+
 // ===== Config (override via env vars for production) =====
 const TMDB_KEY = process.env.TMDB_KEY || '61e2290429798c561450eb56b26de19b';
 const STREAM_API = 'https://api.wecollege.net';
@@ -88,7 +174,7 @@ async function getSeed(mediaId) {
   const now = Date.now();
   const cached = seedCache.get(mediaId);
   if (cached && cached.expiresAt - 5000 > now) return cached.seed;
-  const r = await fetch(`${STREAM_API}/seed?mediaId=${mediaId}`, { headers: HDRS });
+  const r = await upstreamFetch(`${STREAM_API}/seed?mediaId=${mediaId}`, { headers: HDRS });
   if (!r.ok) throw new Error(`seed HTTP ${r.status}`);
   const data = await r.json();
   seedCache.set(mediaId, { seed: data.seed, expiresAt: now + (data.ttlMs || 30000) });
@@ -105,7 +191,7 @@ async function getSources(server, p) {
       tmdbId: p.tmdbId, imdbId: p.imdbId, b35ebba4: p.b35ebba4,
       enc: '2', seed,
     });
-    const r = await fetch(`${STREAM_API}/${server}/sources?${params}`, { headers: HDRS });
+    const r = await upstreamFetch(`${STREAM_API}/${server}/sources?${params}`, { headers: HDRS });
     if (r.status === 401 && attempt === 0) { seedCache.delete(p.tmdbId); continue; }
     if (!r.ok) throw new Error(`${server} HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
     const ct = await r.text();
@@ -119,7 +205,7 @@ async function getTmdbMeta(tmdbId, typeHint) {
   const types = typeHint ? [typeHint, typeHint === 'tv' ? 'movie' : 'tv'] : ['tv', 'movie'];
   for (const t of types) {
     const url = `https://api.themoviedb.org/3/${t}/${tmdbId}?api_key=${TMDB_KEY}&append_to_response=external_ids`;
-    const r = await fetch(url);
+    const r = await upstreamFetch(url, {}, { proxy: PROXY_TMDB });
     if (r.ok) {
       const d = await r.json();
       return {
@@ -162,7 +248,16 @@ router.get('/', (req, res) => {
       season: 'Season number (default 1, TV only)',
       episode: 'Episode number (default 1, TV only)',
       type: 'tv or movie (default: auto-detect, tries tv first)',
+      worker: 'Set worker=1 to rewrite stream + subtitle URLs through the CF worker (default off)',
     },
+    proxy: {
+      enabled: PROXY_ENABLED && !!proxyAgent,
+      host: PROXY_HOST,
+      port: PROXY_PORT,
+      tmdbThroughProxy: PROXY_TMDB,
+      fallbackDirect: PROXY_FALLBACK_DIRECT,
+    },
+    workerUrl: WORKER_BASE,
     servers: SERVERS.map((name, i) => ({ id: i + 1, name })),
     caching: `Successful responses cached for ${CACHE_TTL / 60000} min. Failures are NOT cached.`,
   });
@@ -200,11 +295,15 @@ router.get('/api/movie/:id', async (req, res) => {
   const season = parseInt(req.query.season, 10) || 1;
   const episode = parseInt(req.query.episode, 10) || 1;
   const typeHint = req.query.type;
+  const useWorker = ['1', 'true', 'yes', 'on'].includes(String(req.query.worker || '').toLowerCase());
+  const useWorker = ['1', 'true', 'yes', 'on'].includes(String(req.query.worker || '').toLowerCase());
 
   const cacheKey = `${tmdbId}:${server}:${season}:${episode}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
-    return res.json({ ...cached.data, server, cached: true, cacheExpiresAt: new Date(cached.expiresAt).toISOString() });
+    // Cache stores RAW (unwrapped) URLs — worker rewriting happens at serve time
+    const data = applyWorker(cached.data, useWorker);
+    return res.json({ ...data, server, worker: useWorker, cached: true, cacheExpiresAt: new Date(cached.expiresAt).toISOString() });
   }
 
   try {
@@ -220,9 +319,10 @@ router.get('/api/movie/:id', async (req, res) => {
     // Cache ONLY on success
     cache.set(cacheKey, { data: result, expiresAt: Date.now() + CACHE_TTL });
 
+    const payload = applyWorker(result, useWorker);
     res.json({
       server, tmdbId, title: meta.title, mediaType: meta.mediaType,
-      imdbId: meta.imdbId, season, episode, cached: false, ...result,
+      imdbId: meta.imdbId, season, episode, worker: useWorker, cached: false, ...payload,
     });
   } catch (e) {
     res.status(502).json({ error: e.message, server, tmdbId });
