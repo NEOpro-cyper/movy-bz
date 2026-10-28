@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 
 // ===== Optional undici ProxyAgent — routes upstream fetches through an HTTP proxy =====
 let undici = null;
@@ -41,21 +42,57 @@ function workerWrap(url) {
   return WORKER_PREFIX + url;
 }
 
-function applyWorker(data, on) {
-  if (!on) return data;
+// ===== Encrypted mode (?data=en) =====
+// Stream/subtitle URLs are replaced with AES-256-GCM tokens that only the
+// EN worker can decrypt — no upstream URL ever appears in the response.
+//   token = "v1." + b64url(iv) + "." + b64url(ciphertext + authtag)
+//   key   = SHA-256(SECRET)              -> AES-256-GCM
+//   iv    = SHA-256("iv:" + url)[0..12]  -> deterministic (same URL = same token)
+const WORKER_URL_EN = (
+  process.env.WORKER_URL_EN || 'https://noisy-feather-adb6.ryklcd0086.workers.dev'
+).replace(/\/+$/, ''); // strip trailing slash
+const TOKEN_SECRET = 'bbef4e4840ab0a33b6c129f0de8b1a6735471c82f43e9babc4adc64c5959a64a';
+
+function b64url(buf) {
+  return Buffer.from(buf).toString('base64url');
+}
+
+function encryptUrlToken(rawUrl) {
+  const key = crypto.createHash('sha256').update(TOKEN_SECRET).digest();
+  const iv = crypto.createHash('sha256').update(`iv:${rawUrl}`).digest().subarray(0, 12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(rawUrl, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `v1.${b64url(iv)}.${b64url(Buffer.concat([ct, tag]))}`;
+}
+
+function proxiedUrl(url, encrypt = false) {
+  if (encrypt) {
+    // EN mode: tokenize absolute http(s) URLs only — relative paths cannot
+    // be decrypted by the worker, so they pass through untouched
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return url;
+    if (url.startsWith(`${WORKER_URL_EN}/v1.`)) return url; // already tokenized — never double-encrypt
+    return `${WORKER_URL_EN}/${encryptUrlToken(url)}`;
+  }
+  return workerWrap(url);
+}
+
+function applyWorker(data, on, encrypt = false) {
+  if (!on && !encrypt) return data;
   const out = structuredClone(data);
   if (Array.isArray(out.sources)) {
-    out.sources = out.sources.map(s => ({ ...s, url: workerWrap(s.url) }));
+    out.sources = out.sources.map(s => ({ ...s, url: proxiedUrl(s.url, encrypt) }));
   }
   if (Array.isArray(out.subtitles)) {
     out.subtitles = out.subtitles.map(t => {
       const copy = { ...t };
-      for (const k of ['url', 'file', 'link']) if (copy[k]) copy[k] = workerWrap(copy[k]);
+      for (const k of ['url', 'file', 'link']) if (copy[k]) copy[k] = proxiedUrl(copy[k], encrypt);
       return copy;
     });
   }
-  if (out.playlist) out.playlist = workerWrap(out.playlist);
-  if (out.thumbnail) out.thumbnail = workerWrap(out.thumbnail);
+  if (out.playlist) out.playlist = proxiedUrl(out.playlist, encrypt);
+  if (out.thumbnail) out.thumbnail = proxiedUrl(out.thumbnail, encrypt);
+  if (encrypt) out.encrypted = true;
   return out;
 }
 
@@ -243,13 +280,14 @@ router.get('/', (req, res) => {
       'GET /api/tv/:id/:season/:episode': 'TV sources — /api/tv/273207/1/1?server=miami&worker=1 (season/episode default to 1)',
       'GET /api/servers': 'List available servers',
     },
-    usage: '/api/tv/273207/1/1?server=miami&worker=1   |   /api/movie/20526?server=miami&worker=0',
+    usage: '/api/tv/273207/1/1?server=miami&worker=1   |   /api/movie/20526?server=miami&data=en',
     params: {
       server: 'Server name (miami, boise, ...) OR 1-indexed number (1-16)',
       season: 'Season number (default 1, TV only)',
       episode: 'Episode number (default 1, TV only)',
       type: 'tv or movie (default: auto-detect, tries tv first)',
       worker: 'Set worker=1 to rewrite stream + subtitle URLs through the CF worker (default off)',
+      data: 'Set data=en to replace stream + subtitle URLs with AES-256-GCM tokens (v1.*) that play through the EN decryptor worker — raw upstream URLs never appear in the response',
     },
     proxy: {
       enabled: PROXY_ENABLED && !!proxyAgent,
@@ -259,6 +297,7 @@ router.get('/', (req, res) => {
       fallbackDirect: PROXY_FALLBACK_DIRECT,
     },
     workerUrl: WORKER_BASE,
+    workerUrlEn: WORKER_URL_EN,
     servers: SERVERS.map((name, i) => ({ id: i + 1, name })),
     caching: `Successful responses cached for ${CACHE_TTL / 60000} min. Failures are NOT cached.`,
   });
@@ -299,13 +338,18 @@ async function handleStream(req, res, { fixedType } = {}) {
   const episode = parseInt(req.params.episode, 10) || parseInt(req.query.episode, 10) || 1;
   const typeHint = fixedType || req.query.type;
   const useWorker = ['1', 'true', 'yes', 'on'].includes(String(req.query.worker || '').toLowerCase());
+  const encrypt = String(req.query.data || '').trim().toLowerCase() === 'en';
 
   const cacheKey = `${tmdbId}:${server}:${season}:${episode}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     // Cache stores RAW (unwrapped) URLs — worker rewriting happens at serve time
-    const data = applyWorker(cached.data, useWorker);
-    return res.json({ ...data, server, worker: useWorker, cached: true, cacheExpiresAt: new Date(cached.expiresAt).toISOString() });
+    const data = applyWorker(cached.data, useWorker, encrypt);
+    return res.json({
+      ...data, server, worker: useWorker, cached: true,
+      ...(encrypt ? { note: 'Stream URLs are AES-256-GCM tokens (v1.*) — they play through the EN decryptor worker' } : {}),
+      cacheExpiresAt: new Date(cached.expiresAt).toISOString(),
+    });
   }
 
   try {
@@ -321,10 +365,12 @@ async function handleStream(req, res, { fixedType } = {}) {
     // Cache ONLY on success
     cache.set(cacheKey, { data: result, expiresAt: Date.now() + CACHE_TTL });
 
-    const payload = applyWorker(result, useWorker);
+    const payload = applyWorker(result, useWorker, encrypt);
     res.json({
       server, tmdbId, title: meta.title, mediaType: meta.mediaType,
-      imdbId: meta.imdbId, season, episode, worker: useWorker, cached: false, ...payload,
+      imdbId: meta.imdbId, season, episode, worker: useWorker, cached: false,
+      ...(encrypt ? { note: 'Stream URLs are AES-256-GCM tokens (v1.*) — they play through the EN decryptor worker' } : {}),
+      ...payload,
     });
   } catch (e) {
     res.status(502).json({ error: e.message, server, tmdbId });
