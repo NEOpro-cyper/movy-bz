@@ -286,8 +286,8 @@ router.get('/', (req, res) => {
       season: 'Season number (default 1, TV only)',
       episode: 'Episode number (default 1, TV only)',
       type: 'tv or movie (default: auto-detect, tries tv first)',
-      worker: 'Set worker=1 to rewrite stream + subtitle URLs through the CF worker (default off)',
-      data: 'Set data=en to replace stream + subtitle URLs with AES-256-GCM tokens (v1.*) that play through the EN decryptor worker — raw upstream URLs never appear in the response',
+   //   worker: 'Set worker=1 to rewrite stream + subtitle URLs through the CF worker (default off)',
+   //   data: 'Set data=en to replace stream + subtitle URLs with AES-256-GCM tokens (v1.*) that play through the EN decryptor worker — raw upstream URLs never appear in the response',
     },
     proxy: {
       enabled: PROXY_ENABLED && !!proxyAgent,
@@ -298,8 +298,8 @@ router.get('/', (req, res) => {
     },
   //  workerUrl: WORKER_BASE,
    // workerUrlEn: WORKER_URL_EN,
-    servers: SERVERS.map((name, i) => ({ id: i + 1, name })),
-    caching: `Successful responses cached for ${CACHE_TTL / 60000} min. Failures are NOT cached.`,
+  //  servers: SERVERS.map((name, i) => ({ id: i + 1, name })),
+  //  caching: `Successful responses cached for ${CACHE_TTL / 60000} min. Failures are NOT cached.`,
   });
 });
 
