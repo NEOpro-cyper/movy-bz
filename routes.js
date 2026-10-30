@@ -280,7 +280,7 @@ router.get('/', (req, res) => {
       'GET /api/tv/:id/:season/:episode': 'TV sources — /api/tv/273207/1/1?server=miami&worker=1 (season/episode default to 1)',
       'GET /api/servers': 'List available servers',
     },
-    usage: '/api/tv/273207/1/1?server=miami&worker=1   |   /api/movie/20526?server=miami&data=en',
+    usage: '/api/tv/273207/1/1?server=miami&worker=1   |   ',
     params: {
       server: 'Server name (miami, boise, ...) OR 1-indexed number (1-16)',
       season: 'Season number (default 1, TV only)',
@@ -296,8 +296,8 @@ router.get('/', (req, res) => {
       tmdbThroughProxy: PROXY_TMDB,
       fallbackDirect: PROXY_FALLBACK_DIRECT,
     },
-    workerUrl: WORKER_BASE,
-    workerUrlEn: WORKER_URL_EN,
+  //  workerUrl: WORKER_BASE,
+   // workerUrlEn: WORKER_URL_EN,
     servers: SERVERS.map((name, i) => ({ id: i + 1, name })),
     caching: `Successful responses cached for ${CACHE_TTL / 60000} min. Failures are NOT cached.`,
   });
