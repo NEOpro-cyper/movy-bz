@@ -291,8 +291,8 @@ router.get('/', (req, res) => {
     },
     proxy: {
       enabled: PROXY_ENABLED && !!proxyAgent,
-      host: PROXY_HOST,
-      port: PROXY_PORT,
+    //  host: PROXY_HOST,
+   //   port: PROXY_PORT,
       tmdbThroughProxy: PROXY_TMDB,
       fallbackDirect: PROXY_FALLBACK_DIRECT,
     },
