@@ -135,7 +135,7 @@ const SERVERS = [
   'miami', 'boise', 'atlanta', 'seattle', 'denver', 'phoenix', 'portland', 'austin',
   'dallas', 'tampa', 'orlando', 'munich', 'berlin', 'paris', 'delhi', 'cancun',
 ];
-const CACHE_TTL = parseInt(process.env.CACHE_TTL_MS || '1800000', 10); // 30 min default
+const CACHE_TTL = parseInt(process.env.CACHE_TTL_MS || '3600000', 10); // 30 min default
 
 // ===== In-memory cache (successful responses only) =====
 const cache = new Map(); // key: `${tmdbId}:${server}:${season}:${episode}` -> { data, expiresAt }
