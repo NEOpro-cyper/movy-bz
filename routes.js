@@ -276,11 +276,11 @@ router.get('/', (req, res) => {
     name: 'Movy API Proxy',
     description: 'Get decrypted stream sources from movy.sx by TMDB ID + server name/number.',
     endpoints: {
-      'GET /api/movie/:id': 'Movie sources — /api/movie/20526?server=miami&worker=1',
-      'GET /api/tv/:id/:season/:episode': 'TV sources — /api/tv/273207/1/1?server=miami&worker=1 (season/episode default to 1)',
+      'GET /api/movie/:id': 'Movie sources — ',
+      'GET /api/tv/:id/:season/:episode': 'TV sources —  (season/episode default to 1)',
       'GET /api/servers': 'List available servers',
     },
-    usage: '/api/tv/273207/1/1?server=miami&worker=1   |   ',
+    usage: '/api/tv/273207/1/1?server=miami   |   ',
     params: {
       server: 'Server name (miami, boise, ...) OR 1-indexed number (1-16)',
       season: 'Season number (default 1, TV only)',
